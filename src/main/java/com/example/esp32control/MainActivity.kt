@@ -43,26 +43,28 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
     private var lastDirSent: String = "stop"
     private var lastSpeedSent: Int = -1
     private val sendIntervalMs = 80L
+
+    // Note: The speedDeltaMin is no longer used in the joystick ticker,
+    // but we can keep it for other potential uses.
     private val speedDeltaMin = 5
 
     private val joyTicker = object : Runnable {
         override fun run() {
             if (joyPressed) {
                 val desired = directionFrom(joyDx, joyDy, joyNorm)
-                val base = seekSpeed.progress
-                val targetSpeed = ((base * joyNorm).roundToInt()).coerceIn(0, 1023)
 
-                if (abs(targetSpeed - lastSpeedSent) >= speedDeltaMin) {
-                    sendCmd("set_speed:$targetSpeed")
-                    lastSpeedSent = targetSpeed
-                }
+                // *** FIX ***
+                // Removed the logic that sent "set_speed" commands from the joystick.
+                // The SeekBar is now the only control that sends speed commands.
+                // This prevents the joystick from overriding the speed set for the forklift/camera.
+
                 if (desired != lastDirSent) {
                     if (desired == "stop") sendCmd("stop") else sendCmd(desired)
                     lastDirSent = desired
                 }
                 uiHandler.postDelayed(this, sendIntervalMs)
             } else {
-                // si se soltó el joystick y quedó moviéndose -> STOP
+                // if the joystick was released while moving -> STOP
                 if (lastDirSent != "stop") {
                     sendCmd("stop")
                     lastDirSent = "stop"
@@ -77,6 +79,7 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
 
         db = DbHelper(this)
 
+        // Initialize all UI components
         editIp = findViewById(R.id.editIp)
         editPort = findViewById(R.id.editPort)
         btnConnect = findViewById(R.id.btnConnect)
@@ -97,7 +100,7 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
         btnCamB = findViewById(R.id.btnCamB)
         txtLogInfo = findViewById(R.id.txtLogInfo)
 
-        // Cargar ajustes guardados
+        // Load saved settings
         db.getSetting("ip")?.let { editIp.setText(it) }
         db.getSetting("port")?.let { editPort.setText(it) }
         updateLogInfo()
@@ -106,25 +109,30 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
             if (client == null) connect() else disconnect()
         }
 
-        // Velocidad base
+        // Base speed for PWM motors
         txtSpeedLabel.text = "Velocidad (0..1023): ${seekSpeed.progress}"
         seekSpeed.setOnSeekBarChangeListener(object: SeekBar.OnSeekBarChangeListener{
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                // Only update the text label while dragging
                 txtSpeedLabel.text = "Velocidad (0..1023): $progress"
-                // Si joystick no está presionado, permite setear velocidad manual
-                if (!joyPressed && client != null) {
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                // *** FIX ***
+                // Send the command only when the user releases the slider.
+                // This sets the speed for PWM actions (forklift, camera) on the ESP32.
+                val progress = seekBar?.progress ?: 512
+                if (client != null) {
                     sendCmd("set_speed:$progress")
                     lastSpeedSent = progress
                 }
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
 
         // Joystick
         joystick.setOnMoveListener(object : JoystickView.OnMoveListener {
             override fun onMove(x: Float, y: Float, norm: Float, isPressed: Boolean) {
-                // Nota: y pantalla hacia abajo es positivo, invertimos eje Y para "arriba = forward"
+                // Note: screen Y is positive downwards, so we invert it for "up = forward"
                 joyDx = x
                 joyDy = -y
                 joyNorm = norm
@@ -139,13 +147,13 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
             }
         })
 
-        // Botones de movimiento
+        // Movement Buttons
         btnForward.setOnClickListener { sendCmd("forward"); lastDirSent = "forward" }
         btnBackward.setOnClickListener { sendCmd("backward"); lastDirSent = "backward" }
         btnLeft.setOnClickListener { sendCmd("left"); lastDirSent = "left" }
         btnRight.setOnClickListener { sendCmd("right"); lastDirSent = "right" }
 
-        // Acciones
+        // Actions
         btnStop.setOnClickListener { sendCmd("stop"); lastDirSent = "stop" }
         btnLedOn.setOnClickListener { sendCmd("led_on") }
         btnLedOff.setOnClickListener { sendCmd("led_off") }
@@ -189,15 +197,15 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
     }
 
     private fun directionFrom(dx: Float, dy: Float, norm: Float): String {
-        if (norm < 0.08f) return "stop"
-        return if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
+        if (norm < 0.08f) return "stop" // Dead zone
+        return if (abs(dx) > abs(dy)) {
             if (dx > 0) "right" else "left"
         } else {
             if (dy > 0) "forward" else "backward"
         }
     }
 
-    // TcpClient.Listener
+    // TcpClient.Listener callbacks
     override fun onConnected() {
         runOnUiThread {
             txtStatus.text = "Conectado"
@@ -215,9 +223,9 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
     }
 
     override fun onMessage(msg: String) {
-        // El firmware puede responder "OK"
-        // Podrías mostrar un Toast si quieres confirmar ACK
-        // runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+        // The firmware might respond with "OK"
+        // You could show a Toast here for ACK confirmation if you want
+        // runOnUiThread { Toast.makeText(this, "ESP32: $msg", Toast.LENGTH_SHORT).show() }
     }
 
     override fun onError(msg: String) {
@@ -225,13 +233,16 @@ class MainActivity : AppCompatActivity(), TcpClient.Listener {
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             txtStatus.text = "Error"
             btnConnect.isEnabled = true
+            client = null // Ensure client is null on error
         }
     }
 
     override fun onPause() {
         super.onPause()
-        // seguridad: detener y desconectar
-        sendCmd("stop")
-        disconnect()
+        // Safety: stop and disconnect when the app is paused
+        if (client != null) {
+            sendCmd("stop")
+            disconnect()
+        }
     }
 }
