@@ -12,8 +12,8 @@ build/
 local.properties
 
 # Generated APKs
-app/release/
-app/build/
+release/
+build/
 
 # Keystore (never commit!)
 *.jks
